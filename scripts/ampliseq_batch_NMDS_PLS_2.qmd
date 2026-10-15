@@ -1,0 +1,941 @@
+---
+title: "Ampliseq ASV analysis: depth, batch effect, NMDS, sPLS-DA and sPLS regression"
+author: "Abu B Siddique"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    embed-resources: true
+    fig-width: 8
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+params:
+  ps_path: "project/dada2_phyloseq.rds"
+  meta_path: "C:/Users/auue0001/OneDrive - Sveriges lantbruksuniversitet/slubi/proj/2025/GAU/metadata.tsv"
+  batch_col: "run"
+  group_col: "District"
+  name_col: "shortName"
+  env_vars: ["pH", "DO", "Temp", "Ammonia"]
+  bc_method: "limma"      # "limma", "center" (label-free) or "none"
+  min_depth: 5000         # flag samples below this many reads
+  nperm: 100              # permutations for the PLS significance tests
+  perm_tune: true         # re-tune keepX inside every permutation (fair; ~10-40 min).
+                          # Set false (or nperm: 20) for quick drafts.
+---
+
+Sources: [mixMC HMP case study](https://mixomics.org/mixmc/hmp-bodysites-case-study/),
+[PLSDAbatch](https://evayiwenwang.github.io/PLSDAbatch_workflow/),
+Nygaard et al. 2016 *Biostatistics* (batch correction and inflated group effects).
+
+# Analysis plan
+
+::: {.callout-important}
+## Read this first: n = 20
+
+With 20 samples and ~4000 ASVs, every supervised model can separate groups perfectly
+**on the training data**. Results only count when they hold up in cross-validation **and**
+beat a permutation null. Every supervised step below has both.
+:::
+
+| # | Step | Question | Method | How `run` is handled | Output |
+|---|---|---|---|---|---|
+| 1 | Sequencing depth | Is depth adequate and is it linked to run or District? | Library sizes, rarefaction curves, rarefaction slope, depth vs PC1 | Depth tested against run | Keep/drop decision |
+| 2 | Design check | Can run and District be separated at all? | Run × District table, Cramér's V, env vars vs run | – | Go/no-go for correction |
+| 3 | Preprocessing | – | Filter rare ASVs, CLR (pseudocount 1) | – | `clr_raw` |
+| 4 | Batch effect | How much variance is run? Does correction remove it without removing District? | PCA, PERMANOVA, variance partitioning, silhouette; `limma::removeBatchEffect` vs per-run centering (vs PLSDA-batch) | Corrected matrix `X_bc` | Chosen correction |
+| 5 | NMDS | Do samples group by District, run, shortName? | NMDS on Bray–Curtis (raw) and Aitchison (raw and corrected); PERMANOVA, betadisper, envfit | Run as a PERMANOVA term; permutations within run | Ordination figures + tests |
+| 6 | sPLS-DA (District) | Which ASVs discriminate Districts? | Tuned sPLS-DA, repeated CV, permutation test, leave-one-run-out | Corrected CLR; permutations redo the correction | BER, selected ASVs (Order-Genus) |
+| 7 | sPLS regression (pH, DO, Temp, Ammonia) | Can the community predict each variable, and which ASVs drive it? | sPLS1 per variable, LOO-CV Q², permutation test, VIP; RDA as a joint model | Correction protects the variable; RDA uses `Condition(run)` | Q², driver ASVs (Order-Genus) |
+| 8 | Other ML | Do results hold with a different model? Does the microbiome add beyond the environment? | Random Forest (genus level), env-only vs microbiome vs both | Label-free per-run centering | Balanced accuracy, Q², importance |
+
+::: {.callout-note}
+## PLS-DA vs PLS for continuous variables
+PLS-**DA** is for categories (District). For pH, DO, Temp and Ammonia the matching method is
+PLS **regression**: sPLS1 (one variable at a time; best for "which ASVs drive pH") or sPLS2
+(all four jointly). Both are in mixOmics and give loadings and VIP scores the same way.
+:::
+
+# Setup
+
+```{r install}
+#| eval: false
+# install.packages(c("vegan", "ggplot2", "ggrepel", "ranger", "readr", "permute"))
+# if (!require("BiocManager")) install.packages("BiocManager")
+# BiocManager::install(c("phyloseq", "mixOmics", "limma"))
+# optional: BiocManager::install("PLSDAbatch")
+```
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(phyloseq)
+  library(vegan)
+  library(limma)
+  library(ggplot2)
+  library(ggrepel)
+  library(mixOmics)   # loaded after vegan; mixOmics:: prefixes used anyway
+  library(cluster)
+  library(permute)
+})
+
+set.seed(5249)
+theme_set(theme_bw(base_size = 11))
+
+batch_col <- params$batch_col
+group_col <- params$group_col
+name_col  <- params$name_col
+env_vars  <- unlist(params$env_vars)
+bc_method <- params$bc_method
+```
+
+## Load data and remove the positive control
+
+```{r load}
+# setwd("C:/Users/auue0001/OneDrive - Sveriges lantbruksuniversitet/slubi/workshops/ML4LS")
+
+ps <- readRDS(params$ps_path)
+# ps <- readRDS("project/dada2_phyloseq.rds")
+
+metadata_df <- as.data.frame(readr::read_delim(params$meta_path, delim = "\t",
+                                               escape_double = FALSE, trim_ws = TRUE))
+rownames(metadata_df) <- metadata_df$sampleID
+sample_data(ps) <- sample_data(metadata_df)
+
+ps <- subset_samples(ps, Group %in% c("1", "2", "3"))   # drop positive control
+ps <- prune_taxa(taxa_sums(ps) > 0, ps)                 # drop ASVs now absent
+ps
+```
+
+## Short ASV IDs and "Order-Genus" labels
+
+```{r taxonomy}
+# ampliseq/DADA2 taxa names are long hashes or sequences: rename to ASV1, ASV2, ...
+asv_map <- data.frame(ASV = paste0("ASV", seq_len(ntaxa(ps))), original = taxa_names(ps))
+taxa_names(ps) <- asv_map$ASV
+
+tax <- as.data.frame(as(tax_table(ps), "matrix"), stringsAsFactors = FALSE)
+names(tax) <- tools::toTitleCase(tolower(names(tax)))   # "genus" -> "Genus"
+
+clean_rank <- function(v) {
+  v <- trimws(sub("^[a-zA-Z]__", "", as.character(v)))  # strip SILVA/GTDB "g__" prefixes
+  bad <- is.na(v) | v == "" |
+    grepl("^(uncultured|unclassified|unknown|metagenome|NA$)", v, ignore.case = TRUE)
+  v[bad] <- NA
+  v
+}
+ranks <- intersect(c("Kingdom", "Domain", "Phylum", "Class", "Order", "Family", "Genus"),
+                   names(tax))
+for (r in ranks) tax[[r]] <- clean_rank(tax[[r]])
+getr <- function(r) if (r %in% names(tax)) tax[[r]] else rep(NA_character_, nrow(tax))
+
+# Order part: Order, else "c_<Class>"; Genus part: Genus, else "f_<Family>"
+ord_part <- ifelse(!is.na(getr("Order")), getr("Order"),
+                   ifelse(!is.na(getr("Class")), paste0("c_", getr("Class")), "Unclassified"))
+gen_part <- ifelse(!is.na(getr("Genus")), getr("Genus"),
+                   ifelse(!is.na(getr("Family")), paste0("f_", getr("Family")), "unclassified"))
+
+tax$OrderGenus <- paste(ord_part, gen_part, sep = "-")              # e.g. "Bacillales-Bacillus"
+tax$Label      <- paste0(tax$OrderGenus, " (", rownames(tax), ")")   # unique plot label
+head(tax[, c("OrderGenus", "Label")])
+```
+
+## Count matrix and metadata
+
+```{r matrices}
+X_raw <- as(otu_table(ps), "matrix")
+if (taxa_are_rows(ps)) X_raw <- t(X_raw)       # samples as rows
+
+meta <- data.frame(sample_data(ps), check.names = FALSE)
+meta <- meta[rownames(X_raw), , drop = FALSE]
+stopifnot(identical(rownames(meta), rownames(X_raw)))
+
+meta[[batch_col]] <- droplevels(factor(meta[[batch_col]]))
+meta[[group_col]] <- droplevels(factor(meta[[group_col]]))
+meta[[name_col]]  <- factor(meta[[name_col]])
+for (v in env_vars) {                        # "7,2" -> 7.2 if read as text
+  if (!is.numeric(meta[[v]])) meta[[v]] <- as.numeric(gsub(",", ".", as.character(meta[[v]])))
+}
+
+dim(X_raw)
+summary(meta[, c(batch_col, group_col, env_vars)])
+```
+
+# Sequencing depth
+
+```{r depth-table}
+depth <- data.frame(sample = rownames(X_raw),
+                    reads  = rowSums(X_raw),
+                    nASV   = rowSums(X_raw > 0),
+                    meta[, c(batch_col, group_col, name_col)],
+                    check.names = FALSE)
+summary(depth$reads)
+cat("max/min depth ratio:", round(max(depth$reads) / min(depth$reads), 1), "\n")
+depth[depth$reads < params$min_depth, ]       # samples below the threshold
+```
+
+```{r depth-plots}
+#| fig-height: 5
+ggplot(depth, aes(reorder(sample, reads), reads, fill = .data[[batch_col]])) +
+  geom_col() + coord_flip() +
+  geom_hline(yintercept = params$min_depth, linetype = 2) +
+  labs(x = NULL, y = "Reads per sample", title = "Library size")
+
+ggplot(depth, aes(.data[[batch_col]], reads, colour = .data[[group_col]])) +
+  geom_boxplot(outlier.shape = NA, colour = "grey50") +
+  geom_jitter(width = 0.15, size = 2.5) +
+  scale_y_log10() + labs(title = "Library size by run")
+
+# Is depth linked to run or District? (a depth difference by run is part of the batch effect)
+anova(lm(as.formula(paste("log10(reads) ~", batch_col, "+", group_col)), data = depth))
+```
+
+```{r rarefaction}
+# Rarefaction curves: a curve that is still rising at its end = undersampled
+rc <- vegan::rarecurve(X_raw, step = max(100, round(min(depth$reads) / 50)), tidy = TRUE)
+rc$run <- meta[as.character(rc$Site), batch_col]
+ggplot(rc, aes(Sample, Species, group = Site, colour = run)) +
+  geom_line() +
+  geom_vline(xintercept = min(depth$reads), linetype = 2) +
+  labs(x = "Reads sampled", y = "ASVs observed", title = "Rarefaction curves")
+
+# Slope at the smallest library size: new ASVs per extra read (close to 0 = saturated)
+depth$slope_at_min <- vegan::rareslope(X_raw, sample = min(depth$reads))
+depth[order(-depth$slope_at_min), c("sample", "reads", "nASV", "slope_at_min")]
+```
+
+::: {.callout-tip}
+## Good's coverage is not informative here
+DADA2 removes singletons, so Good's coverage (1 − singletons/reads) is ~1 for every sample.
+Use the rarefaction curves and slope instead.
+:::
+
+## Alpha diversity at even depth (depth-controlled)
+
+Rarefying is used **only** here. Multivariate analyses use CLR on unrarefied counts.
+
+```{r alpha}
+ps_rare <- rarefy_even_depth(ps, sample.size = min(depth$reads), rngseed = 5249,
+                             replace = FALSE, verbose = FALSE)
+alpha <- estimate_richness(ps_rare, measures = c("Observed", "Shannon"))
+rownames(alpha) <- sample_names(ps_rare)   # estimate_richness can mangle names (e.g. "X1A")
+alpha <- cbind(alpha, meta[rownames(alpha), c(batch_col, group_col)])
+
+ggplot(alpha, aes(.data[[group_col]], Shannon, colour = .data[[batch_col]])) +
+  geom_point(size = 3, position = position_jitter(width = 0.1)) +
+  labs(title = paste("Shannon at", min(depth$reads), "reads"))
+
+# District effect adjusted for run (type II: each term after the other)
+drop1(lm(as.formula(paste("Shannon ~", group_col, "+", batch_col)), data = alpha), test = "F")
+```
+
+# Design check: is run confounded with District?
+
+```{r design-check}
+tab <- table(meta[[group_col]], meta[[batch_col]], dnn = c(group_col, batch_col))
+tab
+
+chi <- suppressWarnings(chisq.test(tab))
+cramer_v <- sqrt(unname(chi$statistic) / (sum(tab) * (min(dim(tab)) - 1)))
+cat("Cramér's V (District vs run):", round(cramer_v, 2), "  (0 = balanced, 1 = fully confounded)\n")
+
+# Fully confounded if every District sits in one run, or every run holds one District
+fully_confounded <- all(rowSums(tab > 0) == 1) || all(colSums(tab > 0) == 1)
+if (fully_confounded) {
+  warning("District and run are fully confounded: batch correction would remove the ",
+          "District signal. Do NOT correct; analyse within run or report run+District jointly.")
+}
+```
+
+```{r env-vs-run}
+#| fig-height: 4
+# Are the measurements themselves different between runs?
+env_long <- do.call(rbind, lapply(env_vars, function(v)
+  data.frame(variable = v, value = meta[[v]], run = meta[[batch_col]],
+             group = meta[[group_col]])))
+ggplot(env_long, aes(run, value, colour = group)) +
+  geom_jitter(width = 0.15, size = 2.5) +
+  facet_wrap(~ variable, scales = "free_y", nrow = 1) +
+  labs(x = batch_col, colour = group_col)
+
+# Share of each variable's variance explained by run (R^2 of lm(var ~ run))
+sapply(env_vars, function(v) {
+  ok <- !is.na(meta[[v]])
+  round(summary(lm(meta[[v]][ok] ~ meta[[batch_col]][ok]))$r.squared, 2)
+})
+```
+
+::: {.callout-warning}
+If a variable's R² with run is close to 1 (e.g. Temp measured once per run), that variable is
+confounded with run. Then its microbiome association cannot be separated from the batch
+effect, and the sPLS model for it should be reported with that caveat.
+:::
+
+# Preprocessing: filtering and CLR
+
+```{r preprocess}
+# Keep ASVs with > 0.01% of all reads and present in >= 2 samples
+keep <- colSums(X_raw) / sum(X_raw) > 1e-4 & colSums(X_raw > 0) >= 2
+X_f  <- X_raw[, keep]
+dim(X_f)
+cat("Reads retained:", round(100 * sum(X_f) / sum(X_raw), 1), "%\n")
+
+clr <- function(x) { lx <- log(x); lx - rowMeans(lx) }   # samples as rows
+clr_raw <- clr(X_f + 1)
+```
+
+```{r depth-vs-pc}
+# Depth artefact check: does depth correlate with the main axes of variation?
+pc_raw <- prcomp(clr_raw)$x[, 1:3]
+round(cor(log10(depth$reads), pc_raw, method = "spearman"), 2)
+```
+
+# Batch effect
+
+## Helper functions
+
+```{r batch-helpers}
+## Batch correction on a CLR matrix (samples x ASVs)
+##  limma : removeBatchEffect, protecting `design` (e.g. ~ District) -- uses labels
+##  center: subtract each run's mean per ASV                         -- label-free
+batch_correct <- function(clr, batch, design = NULL, method = bc_method) {
+  batch <- droplevels(factor(batch))
+  if (method == "none" || nlevels(batch) < 2) return(clr)
+  if (method == "center") {
+    out <- clr
+    for (b in levels(batch)) {
+      i <- batch == b
+      out[i, ] <- sweep(clr[i, , drop = FALSE], 2, colMeans(clr[i, , drop = FALSE]))
+    }
+    return(sweep(out, 2, colMeans(clr), "+"))
+  }
+  if (method == "limma") {
+    if (is.null(design)) design <- matrix(1, nrow(clr), 1)
+    full <- cbind(design, model.matrix(~ batch)[, -1, drop = FALSE])
+    if (qr(full)$rank < ncol(full)) {
+      warning("Batch is confounded with the protected design; returning uncorrected data.")
+      return(clr)
+    }
+    return(t(limma::removeBatchEffect(t(clr), batch = batch, design = design)))
+  }
+  stop("Unknown method: ", method)
+}
+
+## How much variance is batch vs group, before/after correction
+batch_metrics <- function(X, meta) {
+  vp <- vegan::varpart(X, reformulate(group_col), reformulate(batch_col), data = meta)
+  fr <- vp$part$indfract$Adj.R.squared          # [a] group only, [b] batch only, [c] shared
+  d  <- dist(X)
+  sil <- function(g) mean(cluster::silhouette(as.integer(factor(g)), d)[, "sil_width"])
+  data.frame(R2adj_District_only = fr[1], R2adj_run_only = fr[2], R2adj_shared = fr[3],
+             silhouette_run = sil(meta[[batch_col]]),
+             silhouette_District = sil(meta[[group_col]]))
+}
+
+pca_plot <- function(X, title) {
+  p  <- prcomp(X)
+  ve <- round(100 * p$sdev^2 / sum(p$sdev^2), 1)
+  df <- data.frame(p$x[, 1:2], meta[, c(batch_col, group_col)], check.names = FALSE)
+  ggplot(df, aes(PC1, PC2, colour = .data[[batch_col]], shape = .data[[group_col]])) +
+    geom_point(size = 3) +
+    labs(x = paste0("PC1 (", ve[1], "%)"), y = paste0("PC2 (", ve[2], "%)"), title = title)
+}
+```
+
+## Assess the batch effect (uncorrected data)
+
+```{r batch-assess}
+pca_plot(clr_raw, "PCA, CLR, uncorrected")
+
+# PERMANOVA on Aitchison distance: each term adjusted for the other (by = "margin")
+d_ait_raw <- dist(clr_raw)
+adonis2(as.formula(paste("d_ait_raw ~", group_col, "+", batch_col)),
+        data = meta, by = "margin", permutations = 999)
+
+# Variance partitioning: District-only, run-only and shared fractions
+vp_raw <- vegan::varpart(clr_raw, reformulate(group_col), reformulate(batch_col), data = meta)
+plot(vp_raw, Xnames = c(group_col, batch_col), bg = c("steelblue", "tomato"))
+```
+
+## Correct and compare methods
+
+```{r batch-correct}
+design_grp <- model.matrix(reformulate(group_col), data = meta)
+
+X_list <- list(
+  none   = clr_raw,
+  center = batch_correct(clr_raw, meta[[batch_col]], method = "center"),
+  limma  = batch_correct(clr_raw, meta[[batch_col]], design = design_grp, method = "limma")
+)
+
+## Optional: PLSDA-batch, designed for microbiome data (Wang & Le Cao 2023)
+# library(PLSDAbatch)
+# pb <- PLSDA_batch(X = clr_raw, Y.trt = meta[[group_col]], Y.bat = meta[[batch_col]],
+#                   ncomp.trt = 1, ncomp.bat = 1, balance = FALSE)  # FALSE = weighted, for unbalanced designs
+# X_list$plsda_batch <- pb$X.nobatch
+
+bm <- do.call(rbind, lapply(X_list, batch_metrics, meta = meta))
+round(bm, 3)
+```
+
+```{r batch-pca-after}
+#| fig-height: 4
+#| layout-ncol: 2
+for (m in names(X_list)) print(pca_plot(X_list[[m]], paste("PCA, CLR,", m)))
+```
+
+**What a good correction looks like:** `R2adj_run_only` and `silhouette_run` drop toward 0,
+while `R2adj_District_only` stays the same or rises.
+
+```{r choose-correction}
+X_bc <- X_list[[bc_method]]      # set bc_method in the YAML header
+cat("Using batch correction:", bc_method, "\n")
+```
+
+::: {.callout-warning}
+## Which correction to trust
+- **limma with District protected** removes run well, but because it uses the District labels,
+  District separation on the corrected data is somewhat optimistic when the design is
+  unbalanced (Nygaard et al. 2016). The permutation tests below redo the correction for every
+  permuted label set, so the p-values stay fair.
+- **Per-run centering** uses no labels, so it is safe inside cross-validation, but it removes
+  some District signal if Districts are unevenly spread across runs.
+- **Statistical tests** (PERMANOVA, RDA) use the uncorrected CLR with run as a term instead of
+  corrected data.
+:::
+
+# NMDS on District, run and shortName
+
+```{r nmds}
+rel <- X_raw / rowSums(X_raw)                     # relative abundance, all ASVs
+
+d_list <- list(
+  "Bray-Curtis (raw)"          = vegan::vegdist(rel, method = "bray"),
+  "Aitchison (raw)"            = dist(clr_raw),
+  "Aitchison (batch-corrected)" = dist(X_bc)
+)
+
+set.seed(5249)
+nmds_list <- lapply(d_list, function(d) vegan::metaMDS(d, k = 2, trymax = 200, trace = 0))
+sapply(nmds_list, function(m) round(m$stress, 3))   # < 0.1 good, 0.1-0.2 fair, > 0.2 poor
+
+nmds_df <- do.call(rbind, lapply(names(nmds_list), function(nm) {
+  m <- nmds_list[[nm]]
+  data.frame(NMDS1 = m$points[, 1], NMDS2 = m$points[, 2],
+             method = paste0(nm, "\nstress = ", round(m$stress, 3)),
+             meta[, c(batch_col, group_col, name_col, env_vars)], check.names = FALSE)
+}))
+```
+
+```{r nmds-plots}
+#| fig-width: 12
+#| fig-height: 4.5
+plot_nmds <- function(df, var) {
+  shape_var <- if (var == batch_col) group_col else batch_col
+  p <- ggplot(df, aes(NMDS1, NMDS2)) + facet_wrap(~ method, scales = "free", nrow = 1)
+  if (nlevels(factor(df[[var]])) <= 12) {
+    p <- p + geom_point(aes(colour = .data[[var]], shape = .data[[shape_var]]), size = 3)
+  } else {                           # many levels (e.g. unique site names): label points
+    p <- p + geom_point(aes(colour = .data[[group_col]], shape = .data[[batch_col]]), size = 2.5) +
+      ggrepel::geom_text_repel(aes(label = .data[[var]]), size = 2.6, max.overlaps = 30)
+  }
+  p + labs(title = paste("NMDS coloured by", var))
+}
+
+plot_nmds(nmds_df, group_col)
+plot_nmds(nmds_df, batch_col)
+plot_nmds(nmds_df, name_col)
+```
+
+## Tests: PERMANOVA and dispersion
+
+```{r nmds-stats}
+perm_within_run <- how(nperm = 999, blocks = meta[[batch_col]])
+
+for (nm in names(d_list)[1:2]) {          # tests on raw distances, run in the model
+  d <- d_list[[nm]]
+  cat("\n=====", nm, "=====\n")
+  print(adonis2(as.formula(paste("d ~", group_col, "+", batch_col)),
+                data = meta, by = "margin", permutations = 999))
+  # District with permutations restricted within run
+  print(adonis2(as.formula(paste("d ~", group_col)), data = meta,
+                permutations = perm_within_run))
+  # shortName only testable if names repeat (replicates)
+  if (nlevels(meta[[name_col]]) < nrow(meta)) {
+    print(adonis2(as.formula(paste("d ~", name_col)), data = meta, permutations = 999))
+  }
+  # Homogeneity of dispersion: a significant PERMANOVA can come from spread, not location
+  for (g in c(group_col, batch_col)) {
+    cat("betadisper:", g, "\n")
+    print(permutest(betadisper(d, meta[[g]]), permutations = 999)$tab)
+  }
+}
+```
+
+## Environmental vectors on the corrected NMDS
+
+```{r envfit}
+nm_bc <- nmds_list[["Aitchison (batch-corrected)"]]
+# permute within run (only possible when no values are missing)
+perm_ef <- if (anyNA(meta[, env_vars])) 999 else how(nperm = 999, blocks = meta[[batch_col]])
+ef <- vegan::envfit(nm_bc, meta[, env_vars, drop = FALSE], na.rm = TRUE,
+                    permutations = perm_ef)
+ef
+
+arr <- as.data.frame(scores(ef, display = "vectors"))
+arr <- arr * 0.8 * max(abs(nm_bc$points)) / max(abs(as.matrix(arr)))   # scale to plot
+arr$var <- rownames(arr)
+pts <- nmds_df[grepl("corrected", nmds_df$method), ]
+
+ggplot(pts, aes(NMDS1, NMDS2)) +
+  geom_point(aes(colour = .data[[group_col]], shape = .data[[batch_col]]), size = 3) +
+  geom_segment(data = arr, aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2),
+               arrow = arrow(length = unit(0.2, "cm")), colour = "grey30") +
+  geom_text(data = arr, aes(NMDS1 * 1.1, NMDS2 * 1.1, label = var), colour = "grey20") +
+  labs(title = "NMDS (Aitchison, corrected) with environmental vectors")
+```
+
+# sPLS-DA on District
+
+Input: the batch-corrected CLR matrix `X_bc`. It is already log-ratio transformed, so
+`logratio = "none"`. There are no repeated measures (one row per sample), so no `multilevel`.
+
+```{r splsda-setup}
+X <- X_bc
+Y <- meta[[group_col]]
+summary(Y)
+n.folds <- min(5, min(table(Y)))    # folds cannot exceed the smallest group
+lab <- tax[colnames(X), "Label"]    # "Order-Genus (ASVxx)"
+```
+
+```{r plsda-ncomp}
+plsda.basic <- mixOmics::plsda(X, Y, ncomp = max(2, nlevels(Y)), logratio = "none")
+set.seed(5249)
+perf.basic <- mixOmics::perf(plsda.basic, validation = "Mfold", folds = n.folds,
+                             nrepeat = 50, progressBar = FALSE)
+plot(perf.basic, overlay = "measure", sd = TRUE)
+ncomp.perf <- perf.basic$choice.ncomp["BER", "max.dist"]
+ncomp.perf
+```
+
+```{r splsda-tune}
+grid.keepX <- c(seq(5, 50, 5), seq(60, 150, 10))
+grid.keepX <- grid.keepX[grid.keepX <= ncol(X)]
+
+set.seed(5249)
+tune <- mixOmics::tune.splsda(X, Y, ncomp = max(2, ncomp.perf), logratio = "none",
+                              test.keepX = grid.keepX, validation = "Mfold",
+                              folds = n.folds, nrepeat = 50, dist = "max.dist",
+                              measure = "BER", progressBar = FALSE)
+plot(tune)
+opt.ncomp <- max(2, tune$choice.ncomp$ncomp)
+opt.keepX <- tune$choice.keepX[1:opt.ncomp]
+opt.ncomp; opt.keepX
+```
+
+```{r splsda-final}
+splsda.final <- mixOmics::splsda(X, Y, ncomp = opt.ncomp, keepX = opt.keepX, logratio = "none")
+
+plotIndiv(splsda.final, comp = c(1, 2), ind.names = FALSE, ellipse = TRUE, legend = TRUE,
+          legend.title = group_col, title = "sPLS-DA (batch-corrected CLR), comps 1 & 2")
+
+cim(splsda.final, comp = 1:2,
+    row.sideColors = color.mixo(as.numeric(Y)),
+    legend = list(legend = levels(Y), col = color.mixo(seq_len(nlevels(Y))), title = group_col),
+    title = "Selected ASVs")
+```
+
+## Cross-validated performance
+
+```{r splsda-perf}
+set.seed(5249)
+perf.final <- mixOmics::perf(splsda.final, validation = "Mfold", folds = n.folds,
+                             nrepeat = 50, dist = "max.dist", progressBar = FALSE)
+perf.final$error.rate          # overall error and BER per component
+perf.final$error.rate.class    # error per District
+cat("Chance-level BER:", round(1 - 1 / nlevels(Y), 2), "\n")
+```
+
+## Permutation test
+
+Labels are shuffled **within run**, the batch correction is redone, and the model is refitted
+with the same ncomp/keepX. The p-value is the share of permutations with a BER as low as the
+real one. (Fixed keepX makes this slightly optimistic; nested tuning is more expensive.)
+
+```{r splsda-perm}
+perm_splsda <- function(clr, Y, batch, ncomp, keepX, nperm, folds, nrepeat = 10) {
+  fit_ber <- function(Yuse) {
+    Xb <- batch_correct(clr, batch, design = model.matrix(~ Yuse))
+    m  <- mixOmics::splsda(Xb, Yuse, ncomp = ncomp, keepX = keepX)
+    p  <- mixOmics::perf(m, validation = "Mfold", folds = folds, nrepeat = nrepeat,
+                         dist = "max.dist", progressBar = FALSE)
+    p$error.rate$BER[ncomp, "max.dist"]
+  }
+  obs  <- fit_ber(Y)
+  null <- vapply(seq_len(nperm), function(i)
+    fit_ber(Y[permute::shuffle(length(Y), control = how(blocks = batch))]), numeric(1))
+  list(observed = obs, null = null, p = (sum(null <= obs) + 1) / (nperm + 1))
+}
+
+set.seed(5249)
+pt_da <- perm_splsda(clr_raw, Y, meta[[batch_col]], opt.ncomp, opt.keepX,
+                     nperm = params$nperm, folds = n.folds)
+cat("Observed BER:", round(pt_da$observed, 3), "  permutation p =", signif(pt_da$p, 3), "\n")
+hist(pt_da$null, breaks = 20, main = "Null BER (permuted District)", xlab = "BER",
+     xlim = range(c(pt_da$null, pt_da$observed)))
+abline(v = pt_da$observed, col = "red", lwd = 2)
+```
+
+## Leave-one-run-out validation
+
+The strictest check: train on all runs but one, predict the held-out run. Uses label-free
+per-run centering, so the held-out run never informs the correction through its labels.
+
+```{r splsda-loro}
+loro_splsda <- function(clr, Y, batch, ncomp, keepX) {
+  batch <- droplevels(factor(batch))
+  Xc    <- batch_correct(clr, batch, method = "center")
+  pred  <- rep(NA_character_, length(Y))
+  for (b in levels(batch)) {
+    te <- batch == b; tr <- !te
+    if (nlevels(droplevels(Y[tr])) < nlevels(Y)) {
+      message("Run ", b, " skipped: training set lacks some Districts"); next
+    }
+    ok <- apply(Xc[tr, ], 2, sd) > 1e-8
+    m  <- mixOmics::splsda(Xc[tr, ok], droplevels(Y[tr]), ncomp = ncomp,
+                           keepX = pmin(keepX, sum(ok)))
+    pred[te] <- predict(m, Xc[te, ok, drop = FALSE], dist = "max.dist")$class$max.dist[, ncomp]
+  }
+  tab <- table(observed = Y, predicted = factor(pred, levels = levels(Y)))
+  list(table = tab, BER = mean(1 - diag(tab) / rowSums(tab), na.rm = TRUE))
+}
+
+loro <- loro_splsda(clr_raw, Y, meta[[batch_col]], opt.ncomp, opt.keepX)
+loro$table
+cat("Leave-one-run-out BER:", round(loro$BER, 3), "\n")
+```
+
+## Discriminating ASVs (Order-Genus)
+
+```{r splsda-loadings}
+#| fig-height: 7
+plotLoadings(splsda.final, comp = 1, method = "mean", contrib = "max",
+             name.var = lab, size.name = 0.7, ndisplay = 20, title = "Loadings, comp 1")
+plotLoadings(splsda.final, comp = 2, method = "mean", contrib = "max",
+             name.var = lab, size.name = 0.7, ndisplay = 20, title = "Loadings, comp 2")
+```
+
+```{r splsda-table}
+splsda_drivers <- do.call(rbind, lapply(seq_len(opt.ncomp), function(k) {
+  sel <- selectVar(splsda.final, comp = k)$value
+  asv <- rownames(sel)
+  stab <- perf.final$features$stable[[k]]
+  data.frame(comp = k, ASV = asv, OrderGenus = tax[asv, "OrderGenus"],
+             loading = sel$value.var,
+             stability = ifelse(asv %in% names(stab), as.numeric(stab[asv]), 0),
+             tax[asv, intersect(c("Phylum", "Class", "Order", "Family", "Genus"), names(tax))],
+             row.names = NULL)
+}))
+head(splsda_drivers[order(splsda_drivers$comp, -abs(splsda_drivers$loading)), ], 30)
+write.csv(splsda_drivers, "sPLSDA_District_drivers.csv", row.names = FALSE)
+```
+
+::: {.callout-tip}
+Report ASVs with high |loading| **and** stability ≥ 0.6–0.8 (selected in most CV folds).
+:::
+
+# sPLS regression on pH, DO, Temp, Ammonia
+
+One sPLS1 model per variable. For each variable:
+
+1. drop samples with a missing value;
+2. batch-correct the CLR matrix, protecting that variable (`design = ~ y`);
+3. tune ncomp and keepX by leave-one-out Q² (Q² > 0 means better than predicting the mean);
+4. permutation test (y shuffled within run, correction and tuning redone);
+5. rank driver ASVs by loading, VIP and selection frequency, labelled Order-Genus.
+
+## Environmental variables first
+
+```{r env-cor}
+round(cor(meta[, env_vars], use = "pairwise.complete.obs", method = "spearman"), 2)
+pairs(meta[, env_vars], col = as.numeric(meta[[group_col]]), pch = as.numeric(meta[[batch_col]]))
+```
+
+## Helper functions
+
+```{r spls-helpers}
+## Cross-validated sPLS1; returns Q2, RMSEP, r(pred, obs) and selection frequency
+cv_spls1 <- function(X, y, keepX, ncomp = 1, folds = length(y), nrepeat = 1,
+                     return_sel = FALSE) {
+  n <- length(y)
+  pred <- matrix(NA_real_, n, nrepeat)
+  sel <- character(0); nfit <- 0
+  for (r in seq_len(nrepeat)) {
+    fid <- if (folds >= n) seq_len(n) else sample(rep(seq_len(folds), length.out = n))
+    for (k in unique(fid)) {
+      te <- which(fid == k); tr <- setdiff(seq_len(n), te)
+      ok <- apply(X[tr, , drop = FALSE], 2, sd) > 1e-8     # drop constant ASVs in training
+      m  <- mixOmics::spls(X[tr, ok, drop = FALSE], y[tr], ncomp = ncomp,
+                           keepX = rep(min(keepX, sum(ok)), ncomp), mode = "regression")
+      pred[te, r] <- predict(m, newdata = X[te, ok, drop = FALSE])$predict[, 1, ncomp]
+      if (return_sel) {
+        sel  <- c(sel, mixOmics::selectVar(m, comp = 1)$X$name)
+        nfit <- nfit + 1
+      }
+    }
+  }
+  tss <- sum((y - mean(y))^2)
+  out <- list(Q2    = mean(apply(pred, 2, function(p) 1 - sum((y - p)^2) / tss)),
+              RMSEP = mean(apply(pred, 2, function(p) sqrt(mean((y - p)^2)))),
+              r     = cor(y, rowMeans(pred)),
+              pred  = rowMeans(pred))
+  if (return_sel) out$sel_freq <- table(sel) / nfit
+  out
+}
+
+## Grid search over ncomp x keepX
+tune_spls1 <- function(X, y, keepX_grid, ncomp_grid = 1:2) {
+  res <- expand.grid(ncomp = ncomp_grid, keepX = keepX_grid[keepX_grid <= ncol(X)])
+  cv  <- lapply(seq_len(nrow(res)), function(i) cv_spls1(X, y, res$keepX[i], res$ncomp[i]))
+  res$Q2    <- sapply(cv, `[[`, "Q2")
+  res$RMSEP <- sapply(cv, `[[`, "RMSEP")
+  res$r     <- sapply(cv, `[[`, "r")
+  list(table = res, best = res[which.max(res$Q2), ])
+}
+
+grid.keepX.reg <- c(5, 10, 15, 20, 30, 50, 75, 100)
+```
+
+## Fit, validate and test each variable
+
+```{r spls-run}
+set.seed(5249)
+reg_res <- lapply(env_vars, function(v) {
+  cc <- !is.na(meta[[v]])
+  y  <- meta[[v]][cc]
+  cl <- clr_raw[cc, ]
+  b  <- droplevels(meta[[batch_col]][cc])
+  make_X <- function(yy) batch_correct(cl, b, design = model.matrix(~ yy))
+
+  Xv   <- make_X(y)
+  tun  <- tune_spls1(Xv, y, grid.keepX.reg)
+  best <- tun$best
+  cvb  <- cv_spls1(Xv, y, best$keepX, best$ncomp, return_sel = TRUE)
+
+  # Permutation null for Q2 (shuffle within run; redo correction [+ tuning])
+  null <- vapply(seq_len(params$nperm), function(i) {
+    yp <- y[permute::shuffle(length(y), control = how(blocks = b))]
+    Xp <- make_X(yp)
+    if (isTRUE(params$perm_tune)) tune_spls1(Xp, yp, grid.keepX.reg)$best$Q2
+    else cv_spls1(Xp, yp, best$keepX, best$ncomp)$Q2
+  }, numeric(1))
+
+  # Final model on all samples
+  fit <- mixOmics::spls(Xv, y, ncomp = best$ncomp, keepX = rep(best$keepX, best$ncomp),
+                        mode = "regression")
+  vipm <- mixOmics::vip(fit)
+  sel  <- mixOmics::selectVar(fit, comp = 1)$X$value
+  asv  <- rownames(sel)
+  sf   <- cvb$sel_freq
+
+  drivers <- data.frame(
+    variable   = v,
+    ASV        = asv,
+    OrderGenus = tax[asv, "OrderGenus"],
+    loading    = sel$value.var,
+    VIP        = vipm[asv, best$ncomp],
+    sel_freq   = ifelse(asv %in% names(sf), as.numeric(sf[asv]), 0),
+    spearman   = sapply(asv, function(a) cor(Xv[, a], y, method = "spearman")),
+    tax[asv, intersect(c("Phylum", "Class", "Order", "Family", "Genus"), names(tax))],
+    row.names = NULL)
+  drivers <- drivers[order(-abs(drivers$loading)), ]
+
+  list(variable = v, n = sum(cc), tuning = tun$table, best = best, cv = cvb,
+       null = null, p = (sum(null >= best$Q2) + 1) / (params$nperm + 1),
+       y = y, fit = fit, drivers = drivers, samples = rownames(cl))
+})
+names(reg_res) <- env_vars
+```
+
+## Model performance
+
+```{r spls-summary}
+reg_summary <- do.call(rbind, lapply(reg_res, function(r) data.frame(
+  variable = r$variable, n = r$n, ncomp = r$best$ncomp, keepX = r$best$keepX,
+  Q2 = round(r$best$Q2, 3), RMSEP = signif(r$best$RMSEP, 3), r_pred_obs = round(r$best$r, 2),
+  null_Q2_95 = round(quantile(r$null, 0.95), 3), perm_p = signif(r$p, 3))))
+reg_summary
+write.csv(reg_summary, "sPLS_env_performance.csv", row.names = FALSE)
+```
+
+::: {.callout-note}
+## How to read this
+- **Q² ≤ 0**: the community does not predict the variable better than its mean.
+- **Q² > 0 and perm_p < 0.05**: predictive signal; interpret the driver ASVs.
+- With `perm_tune: true` the null is tuned the same way as the real model, so it is fair
+  even though the best Q² was picked from a grid.
+:::
+
+```{r spls-obs-pred}
+#| fig-width: 10
+#| fig-height: 3.5
+op <- do.call(rbind, lapply(reg_res, function(r)
+  data.frame(variable = paste0(r$variable, " (Q2 = ", round(r$best$Q2, 2), ")"),
+             observed = r$y, predicted = r$cv$pred,
+             run = meta[r$samples, batch_col])))
+ggplot(op, aes(observed, predicted, colour = run)) +
+  geom_abline(linetype = 2, colour = "grey50") +
+  geom_point(size = 2.5) +
+  facet_wrap(~ variable, scales = "free", nrow = 1) +
+  labs(title = "LOO-CV predictions, sPLS1")
+```
+
+## Driver ASVs (Order-Genus)
+
+```{r spls-drivers}
+#| fig-height: 6
+for (r in reg_res) {
+  top <- head(r$drivers, 20)
+  top$Label <- paste0(top$OrderGenus, " (", top$ASV, ")")
+  top$direction <- ifelse(top$spearman > 0, "positive", "negative")
+  print(
+    ggplot(top, aes(reorder(Label, loading), loading, fill = direction)) +
+      geom_col() + coord_flip() +
+      scale_fill_manual(values = c(positive = "#D55E00", negative = "#0072B2")) +
+      labs(x = NULL, y = "Loading, comp 1",
+           title = paste0(r$variable, ": top driver ASVs (Q2 = ", round(r$best$Q2, 2),
+                          ", p = ", signif(r$p, 2), ")"))
+  )
+}
+
+drivers_all <- do.call(rbind, lapply(reg_res, `[[`, "drivers"))
+write.csv(drivers_all, "sPLS_env_driver_ASVs.csv", row.names = FALSE)
+head(drivers_all[drivers_all$sel_freq >= 0.6, c("variable", "ASV", "OrderGenus",
+                                                "loading", "VIP", "sel_freq", "spearman")], 40)
+```
+
+## Driver × variable heatmap (within-run correlations)
+
+ASVs and environmental variables are both centred within run before correlating, so the
+correlations are not driven by run differences.
+
+```{r spls-heatmap}
+#| fig-height: 9
+top_asv <- unique(unlist(lapply(reg_res, function(r) head(r$drivers$ASV, 15))))
+Xc  <- batch_correct(clr_raw, meta[[batch_col]], method = "center")[, top_asv]
+Ec  <- sapply(env_vars, function(v) meta[[v]] - ave(meta[[v]], meta[[batch_col]],
+                                                    FUN = function(z) mean(z, na.rm = TRUE)))
+cmat <- cor(Xc, Ec, method = "spearman", use = "pairwise.complete.obs")
+rownames(cmat) <- tax[top_asv, "Label"]
+cmat[is.na(cmat)] <- 0   # a variable constant within every run gives NA
+cim(cmat, margins = c(6, 16), title = "Within-run Spearman: driver ASVs vs environment")
+```
+
+## Joint model: RDA with run as a conditioning variable
+
+A classical companion to sPLS: how much community variation the four variables explain
+together, after removing run.
+
+```{r rda}
+cc  <- complete.cases(meta[, env_vars])
+Yc  <- clr_raw[cc, ]
+env_s <- data.frame(scale(meta[cc, env_vars]), meta[cc, batch_col, drop = FALSE],
+                    check.names = FALSE)
+
+rda_env <- vegan::rda(as.formula(paste("Yc ~", paste(env_vars, collapse = " + "),
+                                       "+ Condition(", batch_col, ")")), data = env_s)
+RsquareAdj(rda_env)
+vif.cca(rda_env)                                  # > 10 = collinear variables
+anova(rda_env, permutations = 999)                # global test
+anova(rda_env, by = "margin", permutations = 999) # each variable given the others
+plot(rda_env, display = c("sites", "bp"), main = "Aitchison RDA | run")
+```
+
+# Other ML approaches
+
+## Random Forest at genus level
+
+Uses genus-level counts (`Order-Genus`), which are fewer and more robust than ASVs at n = 20,
+with label-free per-run centering so leave-one-out CV has no leakage.
+
+```{r rf-features}
+library(ranger)
+G_raw <- t(rowsum(t(X_raw), group = tax[colnames(X_raw), "OrderGenus"]))   # samples x genera
+G_raw <- G_raw[, colSums(G_raw) / sum(G_raw) > 1e-4 & colSums(G_raw > 0) >= 2]
+G_bc  <- batch_correct(clr(G_raw + 1), meta[[batch_col]], method = "center")
+g_map <- setNames(colnames(G_bc), paste0("G", seq_len(ncol(G_bc))))        # safe names
+colnames(G_bc) <- names(g_map)
+dim(G_bc)
+
+loo_rf <- function(Xdf, y, num.trees = 1000) {
+  pred <- vector("list", length(y))
+  for (i in seq_along(y)) {
+    m <- ranger::ranger(x = Xdf[-i, , drop = FALSE], y = y[-i], num.trees = num.trees,
+                        seed = 5249 + i)
+    pred[[i]] <- predict(m, data = Xdf[i, , drop = FALSE])$predictions
+  }
+  if (is.factor(y)) factor(sapply(pred, as.character), levels = levels(y)) else unlist(pred)
+}
+bal_acc <- function(obs, pred) { t <- table(obs, pred); mean(diag(t) / rowSums(t)) }
+```
+
+```{r rf-district}
+# Does the microbiome add beyond the environment? (complete cases only)
+cc  <- complete.cases(meta[, env_vars])
+Yd  <- droplevels(meta[[group_col]][cc])
+sets <- list(
+  microbiome  = as.data.frame(G_bc[cc, ]),
+  environment = meta[cc, env_vars, drop = FALSE],
+  both        = cbind(as.data.frame(G_bc[cc, ]), meta[cc, env_vars, drop = FALSE])
+)
+rf_district <- sapply(sets, function(s) round(bal_acc(Yd, loo_rf(s, Yd)), 2))
+rf_district
+cat("Chance balanced accuracy:", round(1 / nlevels(Yd), 2), "\n")
+
+# Permutation importance from the full microbiome model
+rf_full <- ranger::ranger(x = as.data.frame(G_bc), y = meta[[group_col]], num.trees = 2000,
+                          importance = "permutation", seed = 5249)
+imp <- sort(rf_full$variable.importance, decreasing = TRUE)[1:20]
+data.frame(OrderGenus = g_map[names(imp)], importance = round(imp, 4), row.names = NULL)
+```
+
+```{r rf-env}
+# RF regression for each environmental variable (LOO Q2), to compare with sPLS
+rf_env <- sapply(env_vars, function(v) {
+  ok <- !is.na(meta[[v]])
+  y  <- meta[[v]][ok]
+  p  <- loo_rf(as.data.frame(G_bc[ok, ]), y)
+  round(1 - sum((y - p)^2) / sum((y - mean(y))^2), 3)
+})
+data.frame(variable = env_vars, Q2_RF = rf_env, Q2_sPLS = reg_summary$Q2)
+```
+
+## Further suggestions
+
+| Method | Why it fits this study | R package |
+|---|---|---|
+| **Log-ratio signatures** (balances) | Finds a small set of taxa ratios that predict the outcome; built for compositional data and small n; very interpretable | `coda4microbiome`, `selbal` |
+| **Elastic net** with nested CV | Sparse linear baseline for District and env variables; compare to sPLS | `glmnet`, `mikropml` |
+| **Differential abundance with run as covariate** | Confirms sPLS/RF driver taxa with a formal model (`~ District + run`, `~ pH + run`) | `ANCOMBC` (ANCOM-BC2), `Maaslin3`, `LinDA` (`MicrobiomeStat`) |
+| **Count-level batch correction** | Corrects counts (not CLR), so Bray–Curtis and DA tools can use corrected data | `ConQuR`, `MMUPHin` |
+| **Mixed models for alpha diversity** | `Shannon ~ District + (1 | run)` treats run as random | `lme4`, `glmmTMB` |
+| **SHAP for the RF model** | Per-sample explanation of which genera push predictions | `kernelshap` + `shapviz` |
+| **Genus vs ASV sensitivity** | Rerun sPLS-DA on `G_bc`; drivers that appear at both levels are more convincing | – |
+| **Sample-size planning** | The permutation nulls show the effect size you can detect; use them to argue for more samples per District/run | – |
+
+::: {.callout-warning}
+## Reporting checklist
+- State the batch correction used and show the before/after variance partitioning.
+- Report CV error **and** permutation p-values for every supervised model; treat
+  leave-one-run-out as the most realistic estimate.
+- Call driver ASVs "associated with", not "causing", the outcome.
+:::
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
