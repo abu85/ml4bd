@@ -118,17 +118,14 @@ for (dist_name in names(distances_subset)) {
   nmds <- metaMDS(distances_subset[[dist_name]], k = 2, trymax = 100, autotransform = TRUE, trace = FALSE)
   nmds_results_subset[[dist_name]] <- nmds
 
-  set.seed(42)
   ef <- envfit(nmds, env_subset, permutations = 999)
   envfit_results_subset[[dist_name]] <- ef
 
-  cat("\n==== envfit (no controls):", dist_name, "====\n")
   print(ef)
 
   file_id <- tolower(gsub("[^A-Za-z]+", "_", dist_name))
 
-  # NMDS + envfit arrows: draw on screen...
-  par(mar = c(5, 4, 4, 10))  # extra right margin for the legend
+  par(mar = c(5, 4, 4, 10)) 
   ordiplot(nmds, display = "sites", type = "n",
            main = paste("NMDS of", dist_name, "Distances (no controls)"))
   mtext(sprintf("Stress = %.3f", nmds$stress), side = 3, line = 0.3)
@@ -137,9 +134,8 @@ for (dist_name in names(distances_subset)) {
   legend("topleft", inset = c(1.02, 0), legend = levels(district_subset),
          col = colors_subset, pch = 19, title = "District", bty = "n", xpd = TRUE)
   plot(ef, p.max = 1, col = "grey20", cex = 0.9)
-  par(mar = c(5, 4, 4, 2) + 0.1)  # back to the default margins
+  par(mar = c(5, 4, 4, 2) + 0.1)  
 
-  # ...then draw the same plot again into a PNG file
   png(file.path(fig_dir, paste0("vegan_nmds_envfit_", file_id, "_no_controls.png")),
       width = 8, height = 6, units = "in", res = 300)
   par(mar = c(5, 4, 4, 10))
@@ -187,3 +183,27 @@ print(permanova_env_bray)
 permanova_env_jaccard <- adonis2(distances_subset[["Jaccard"]] ~ pH + DO + Temp + Ammonia,
                                  data = meta_subset, permutations = 999, by = "margin")
 print(permanova_env_jaccard)
+
+
+# ---- Batch effect: sequencing run ----
+print(table(meta_subset$run, meta_subset$District))
+
+for (dist_name in names(distances_subset)) {
+  d <- distances_subset[[dist_name]]
+  set.seed(42)
+
+  print(adonis2(d ~ run, data = meta_subset, permutations = 999))
+
+  print(adonis2(d ~ run + District, data = meta_subset, permutations = 999, by = "margin"))
+
+  print(adonis2(d ~ run + pH + DO + Temp + Ammonia, data = meta_subset,
+                permutations = 999, by = "margin"))
+
+  within_run <- how(nperm = 999, blocks = meta_subset$run)
+  print(adonis2(d ~ District, data = meta_subset, permutations = within_run))
+
+  print(adonis2(d ~ pH + DO + Temp + Ammonia, data = meta_subset,
+                permutations = within_run, by = "margin"))
+
+  print(envfit(nmds_results_subset[[dist_name]], env_subset, permutations = within_run))
+}
