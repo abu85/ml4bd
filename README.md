@@ -14,3 +14,10 @@
 
 ## Shiny App
 - Please access our results through the Shiny app: ...
+
+## Used packages
+phyloseq 1.44.0
+vegan 2.6-10
+mixOmics version 6.24.0
+ggplot2 version 4.0.3
+
