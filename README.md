@@ -13,11 +13,11 @@
 - Sequencing artifacts effects or noise was removed (we removed ASVs that have less than 5 counts over all samples)
 
 ## Shiny App
-- Please access our results through the Shiny app: ...
+Please access our results through the Shiny app: ...
 
 ## Used packages
-phyloseq 1.44.0
-vegan 2.6-10
-mixOmics version 6.24.0
-ggplot2 version 4.0.3
-
+- phyloseq 1.44.0
+- vegan 2.6-10
+- mixOmics version 6.24.0
+- ggplot2 version 4.0.3
+- 
