@@ -6,9 +6,11 @@
 * In [figures](https://github.com/abu85/ml4bd/tree/main/figures), all figures produced during analyses are stored
 
 ## Source dataset
-17 samples (16S rDNA ampliSeq, freshwater) 
-3 locations (districts) 
-4041 taxa (ASV)
-Environmental variables measured at sampling locations: pH, DO (Dissolved Oxygen) concentrations, Temperature, Ammonia concentration
-Sequencing artifacts effects or noise was removed (we removed ASVs that have less than 5 counts over all samples)
+- 17 samples (16S rDNA ampliSeq, freshwater) 
+- 3 locations (districts) 
+- 4041 taxa (ASV)
+- Environmental variables measured at sampling locations: pH, DO (Dissolved Oxygen) concentrations, Temperature, Ammonia concentration
+- Sequencing artifacts effects or noise was removed (we removed ASVs that have less than 5 counts over all samples)
 
+## Shiny App
+- Please access our results through the Shiny app: ...
