@@ -6,4 +6,9 @@
 * In [figures](https://github.com/abu85/ml4bd/tree/main/figures), all figures produced during analyses are stored
 
 ## Source dataset
-16S amplicon sequencing data, 17 samples from 3 districts in Bangladesh
+17 samples (16S rDNA ampliSeq, freshwater) 
+3 locations (districts) 
+4041 taxa (ASV)
+Environmental variables measured at sampling locations: pH, DO (Dissolved Oxygen) concentrations, Temperature, Ammonia concentration
+Sequencing artifacts effects or noise was removed (we removed ASVs that have less than 5 counts over all samples)
+
