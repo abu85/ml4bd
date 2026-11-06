@@ -21,3 +21,11 @@ Please access our results through the Shiny app: ...
 - mixOmics version 6.24.0
 - ggplot2 version 4.0.3
 - 
+
+# Members contributions
+- All members contributed to the choice of methods
+- All members worked on the preprocessing of the data
+- Justine ran the NMDS/PERMANOVA and PLS-DA
+- Abu ran the sPLS-DA
+- Lovisa ran the hierarchical clustering, built the Shiny App and deployed it
+- All members participated in the communication of the results (powerpoint, narrative, github...)
