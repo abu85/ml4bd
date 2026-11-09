@@ -13,7 +13,7 @@
 - Sequencing artifacts effects or noise was removed (we removed ASVs that have less than 5 counts over all samples)
 
 ## Shiny App
-Please access our results through the Shiny app: ...
+Please access our results through the Shiny app: [https://lovisalindquist.shinyapps.io/ml4bd/](https://lovisalindquist.shinyapps.io/ml4bd/)
 
 ## Used packages
 - phyloseq 1.44.0
